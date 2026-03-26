@@ -12,6 +12,7 @@ import requests
 import cloudscraper
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, unquote
+from cookie_context import normalize_cookie_records, parse_seed_cookie_string, success_path_label
 
 # ================= 配置常量 =================
 RENEW_DAYS = 7
@@ -187,15 +188,60 @@ class HidenCloudBot:
     def load_cookie_str(self, cookie_str):
         if not cookie_str:
             return
-        cookie_dict = {}
-        for item in cookie_str.split(';'):
-            if '=' in item:
-                k, v = item.split('=', 1)
-                cookie_dict[k.strip()] = v.strip()
-        self.session.cookies.update(cookie_dict)
+        for cookie in parse_seed_cookie_string(cookie_str):
+            self.session.cookies.set_cookie(
+                requests.cookies.create_cookie(
+                    name=cookie['name'],
+                    value=cookie['value'],
+                    domain=cookie['domain'],
+                    path=cookie.get('path', '/'),
+                    secure=bool(cookie.get('secure', True)),
+                )
+            )
 
     def get_cookie_str(self):
         return '; '.join([f"{c.name}={c.value}" for c in self.session.cookies])
+
+    def normalize_critical_cookies(self, stage=""):
+        records = []
+        for cookie in self.session.cookies:
+            records.append({
+                'name': cookie.name,
+                'value': cookie.value,
+                'domain': cookie.domain or '',
+                'path': cookie.path or '/',
+                'secure': bool(cookie.secure),
+                'expires': cookie.expires,
+                'rest': getattr(cookie, '_rest', {}) or {},
+            })
+
+        normalized, changes = normalize_cookie_records(records)
+        if not changes:
+            return False
+
+        new_jar = requests.cookies.RequestsCookieJar()
+        for record in normalized:
+            new_jar.set_cookie(
+                requests.cookies.create_cookie(
+                    name=record['name'],
+                    value=record['value'],
+                    domain=record.get('domain', ''),
+                    path=record.get('path', '/'),
+                    secure=bool(record.get('secure', False)),
+                    expires=record.get('expires'),
+                    rest=record.get('rest', {}),
+                )
+            )
+        self.session.cookies = new_jar
+
+        changed_names = []
+        for change in changes:
+            name = change['name']
+            if name not in changed_names:
+                changed_names.append(name)
+        stage_text = f"{stage} " if stage else ""
+        self.log(f"[COOKIE_NORMALIZED] {stage_text}检测到并归一化关键 Cookie: {', '.join(changed_names)}")
+        return True
 
     def find_cookie_value(self, *names, preferred_domain=''):
         matches = []
@@ -241,7 +287,7 @@ class HidenCloudBot:
         self.rebuild_session(current_cookie)
 
         if self.init():
-            return True
+            return True, 'invoice_page'
 
         self.log("⚠️ 当前 Cookie 重建会话后初始化失败，回退环境变量 Cookie 再试一次...")
         self.rebuild_session()
@@ -252,6 +298,7 @@ class HidenCloudBot:
         full_url = urljoin(self.base_url, url)
         try:
             resp = self.session.request(method, full_url, data=data, headers=headers, timeout=30)
+            self.normalize_critical_cookies(f"{method} {url}")
             return resp
         except Exception as e:
             self.log(f"请求异常: {e}")
@@ -396,7 +443,7 @@ class HidenCloudBot:
         if '/invoice/' in response.url:
             self.log("⚡️ 续期成功，已跳转账单页，自动执行支付...")
             self.perform_pay_from_html(response.text, response.url)
-            return True
+            return True, 'invoice_link'
 
         soup_resp = BeautifulSoup(response.text, 'html.parser')
         invoice_links = self.extract_invoice_links(soup_resp, require_payment_context=False)
@@ -404,7 +451,7 @@ class HidenCloudBot:
             invoice_url = invoice_links[0]
             self.log(f"🔗 在响应HTML中发现账单链接: {invoice_url}")
             self.pay_single_invoice(invoice_url)
-            return True
+            return True, 'server_reject'
 
         err_div = soup_resp.find('div', class_=re.compile(r'(alert-danger|text-danger|error)'))
         if err_div:
@@ -412,7 +459,7 @@ class HidenCloudBot:
             return True
 
         if not allow_invoice_poll:
-            return False
+            return False, None
 
         if response.status_code == 419:
             self.log("⚠️ 续期请求返回 419，重试后仍未跳转，开始检查是否生成账单...")
@@ -420,7 +467,10 @@ class HidenCloudBot:
             self.log(f"⚠️ 提交成功但未自动跳转，响应URL: {response.url} | 状态码: {response.status_code}")
             self.log("后置轮询检查账单...")
 
-        return self.check_and_pay_invoices(service_id, is_precheck=False, retries=6, retry_delay=8)
+        invoice_polled = self.check_and_pay_invoices(service_id, is_precheck=False, retries=6, retry_delay=8)
+        if invoice_polled:
+            return True, 'invoice_poll'
+        return False, None
 
     def init(self):
         self.log("正在验证登录状态...")
@@ -451,7 +501,7 @@ class HidenCloudBot:
             self.log(f"❌ 初始化异常: {e}")
             return False
 
-    def process_service(self, service, allow_rebuild_retry=True, skip_initial_delay=False):
+    def process_service(self, service, allow_rebuild_retry=True, skip_initial_delay=False, rebuild_retry=False):
         if not skip_initial_delay:
             sleep_random(2000, 4000)
         self.log(f">>> 处理服务 ID: {service['id']}")
@@ -488,24 +538,31 @@ class HidenCloudBot:
             self.log(f"提交续期 ({RENEW_DAYS}天)...")
             sleep_random(1000, 2000)
 
+            submit_stage = 'first_submit'
             res = self.submit_renew_request(service['id'], soup, manage_res.url)
-            handled = self.try_handle_invoice_from_response(service['id'], res, allow_invoice_poll=False)
+            handled, outcome = self.try_handle_invoice_from_response(service['id'], res, allow_invoice_poll=False)
 
             if not handled and res.status_code == 419:
                 self.log("♻️ 首次续期请求返回 419，刷新管理页获取新 Token 后重试一次...")
                 sleep_random(1000, 2000)
                 manage_res, soup = self.fetch_manage_page(service['id'])
+                submit_stage = 'same_session_retry'
                 res = self.submit_renew_request(service['id'], soup, manage_res.url)
-                handled = False
+                handled, outcome = False, None
 
             # ================== 5. 结果校验与支付 ==================
             if not handled:
-                handled = self.try_handle_invoice_from_response(service['id'], res)
+                handled, outcome = self.try_handle_invoice_from_response(service['id'], res)
+
+            if handled and outcome in {'invoice_page', 'invoice_link', 'invoice_poll'}:
+                self.log(f"[RENEW_RESULT] {success_path_label(submit_stage, rebuild_retry=rebuild_retry)}")
+            elif handled and outcome == 'server_reject':
+                self.log(f"[RENEW_RESULT] {'重建会话后' if rebuild_retry else '当前会话'}提交已被服务端拒绝")
 
             if not handled and allow_rebuild_retry and res.status_code == 419:
                 self.log("♻️ 当前会话内续期仍失败，模拟重跑 Job：重建会话后完整重试当前服务一次...")
                 if self.rebuild_session_and_reinit():
-                    self.process_service(service, allow_rebuild_retry=False, skip_initial_delay=True)
+                    self.process_service(service, allow_rebuild_retry=False, skip_initial_delay=True, rebuild_retry=True)
                 else:
                     self.log("❌ 重建会话后仍无法重新登录，放弃本服务本轮续期")
                     self.mark_retry_needed(f"服务 {service['id']} 重建会话后仍无法完成续期")
