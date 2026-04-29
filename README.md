@@ -4,6 +4,18 @@
 ![GitHub Actions](https://img.shields.io/badge/GitHub_Actions-Automated-green.svg)
 ![License](https://img.shields.io/badge/License-MIT-yellow.svg)
 
+> ⚠️ **注意：这是纯 Cookie 版本，不含浏览器登录功能。**
+> 如需账号密码登录 + 自动转存 Cookie 的版本，请使用 [`hiden-renew`](https://github.com/btpp04/hiden-renew)（私库）。
+>
+> | | 本仓库 (Python Cookie版) | hiden-renew (Node.js 账密版) |
+> |---|---|---|
+> | 登录方式 | ❌ 仅 Cookie | ✅ 账号密码 → 自动转 Cookie |
+> | CF Turnstile | 无法自动过 | CDP 注入 + Shadow DOM 劫持 |
+> | Cookie 持久化 | WebDAV (Infinicloud) | GitHub Variables |
+> | 通知 | 青龙风格多渠道 | Telegram + Email |
+> | 代理 | 无 | sing-box 多协议 |
+> | 推荐度 | ⭐ 需手动获取Cookie | ⭐⭐⭐ 全自动 |
+
 基于 Python 编写的 HidenCloud（海敦云）自动续期与支付脚本，专为 GitHub Actions 设计。
 
 ✨ **核心亮点：**
